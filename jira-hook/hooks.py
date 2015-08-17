@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+
 import web
 import json
 import logging
@@ -10,37 +12,39 @@ from daemon import runner
 import base64
 import re
 import requests
+import ConfigParser
 import threading
 
-#Script to update and create tickets using Pagerduty's webhook feature.
-#web.py, jira-python, python-dateutil, python-daemon required.
+#Load Variables
+config = ConfigParser.ConfigParser()
+config.read('hook.conf')
 
-####################################################
-####################################################
-#
-# PagerDuty Client section
-# id_dict layout is id_dict[Jira Project][List of alerts associated with them]
-id_dict={'BPRO': ['P9S0KPI','PKPSM9M','PA6CJ46','PI4I1Y1', 'PVRLZMA', 'PVRLZMA', 'PDF91WV', 'P725LSF'], 'CQPRO': ['PA7DH49', 'PZYKY3M', 'PKTHA82', 'PL2AJ8P', 'P7X1XIX', 'PICFKO9', 'PO00A10'], 'CVPRO': ['P1EJEMQ', 'PE0EFQO'], 'FMPRO': ['P1UJCJ3', 'PSRRILL', 'P4WUGHI', 'PPPGF06', 'PJ7BWE1', 'P053XJK'], 'HAL': ['P4SCXWR', 'P4SI8MK', 'PSNFO40', 'PSNZZAU', 'PYPEUZL', 'PLAYELX', 'P053XJK'], 'HANESPRO': ['PV8SUNF', 'PK46LLO', 'POJ8U5K', 'PG3PWRI', 'PM5URRP', 'PPKEADR', 'PTIZPOZ'], 'LCTPRO': ['PJ15R26', 'PCWDSEN', 'P0J3TIG', 'P7QVS6C', 'PBNXPN9', 'P22HYZO', 'P8LV4HH'], 'LNDT': ['PNOO9H0', 'PPTA8TT', 'P8HP7E3', 'PY68OL3', 'PQSAN66', 'PSIXVQC', 'POJNMV5'], 'PROPS': ['PNFQGVH'], 'HDPT': ['PB416YR', 'PXV2CKJ', 'PB4QDA9', 'PLLL8CU', 'P2XD823', 'P50AT9Z', 'PUEJBFE'], 'TRAC': ['PE1H18C', 'P5X4AUU', 'PARE16C', 'P2R72Q8', 'PE8Q6KX', 'PGBNS53', 'PKHUCTR', 'P9HFUOM'], 'TUMIPRO': ['PLA05VE', 'PAF33RB', 'PEZ6NW4', 'PBBQSIG', 'PTE98S1', 'PQGTQED', 'PEJH7J4', 'PM2785X', 'PDGAHTE', 'PDYO8DB', 'PL8R7AY', 'POKC6BZ', 'PQ8VSOP'], 'SAVPRO': ['PVXNAWR', 'P7CQYSO', 'PJQ0XNF', 'PYV3V6C', 'PNA6T2Z', 'PMNGRL3', 'PCC0J9W', 'P1ILR7S'], 'SBSPRO': ['P3B1AI3', 'PUTEXZU', 'PI9UUQI', 'P9WAQ5C', 'P1ZW5BK', 'PSS92TO']}
-#
-#
-####################################################
+jira_server = config.get('jira-hook', 'jira_server')
+jira_user = config.get('jira-hook', 'jira_user')
+jira_pass = base64.b64decode(config.get('jira-hook', 'jira_pass'))
+mon_ticket = config.get('jira-hook', 'mon_ticket')
+pager_api = config.get('jira-hook', 'pager_api')
+pager_url = config.get('jira-hook', 'pager_url')
+log_file = config.get('jira-hook', 'log_file')
+listen_ip = config.get('jira-hook', 'listen_ip')
+listen_port = config.getint('jira-hook', 'listen_port')
+
+
+#Load PagerDuty Client Section
+temp_load = dict(config.items('pagerduty_services'))
+id_dict = {}
+for i in temp_load:
+    id_dict[i.upper()] = [x.strip() for x in temp_load[i].split(',')]
+
 
 
 #Credentials to auth with Jira
-jira_password = base64.b64decode("")
-jira = JIRA(basic_auth=('', jira_password), options = { 'server': '', 'verify': False } )
-apikey= ""
-
-#Log API URL
-log_url = "https://crossview.pagerduty.com/api/v1/log_entries/"
-
-#Map / to class hooks
-urls = ('/.*', 'hooks')
-app = web.application(urls, globals())
+requests.packages.urllib3.disable_warnings()
+jira = JIRA(basic_auth=(jira_user, jira_pass), options = { 'server': jira_server, 'verify': False } )
 
 #Logging information
 logger = logging.getLogger('hooks')
-hdlr = logging.FileHandler('/home/CROSSVIEW/cfrasure/jira-hook/hook.log')
+hdlr = logging.FileHandler(log_file)
 formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
 hdlr.setFormatter(formatter)
 logger.addHandler(hdlr) 
@@ -48,6 +52,7 @@ logger.setLevel(logging.DEBUG)
 
 #We sometimes get multiple posts for the same issue. Unsure if this is a pd bug, but a quick fix is creating a list and checking against past 2 minutes
 recent_incidents = []
+tLock = threading.Lock()
 
 #Items not currently in use
 """Set labels with issue.update(labels=['AAA', 'BBB'])
@@ -72,10 +77,10 @@ class hooks:
 					logger.debug('Removing %s from recent_incidents' % sub)
 					recent_incidents.remove(sub)
 
-	def request_email(self,log_url, apikey, log_id, version):
+	def request_email(self,pager_url, pager_api, log_id, version):
 		#Grab E-mail from pagerduty based on log id
-		logger.debug('Using %s%s' % (log_url,log_id))
-		r = requests.get(log_url + log_id, headers={'Authorization': 'Token token=%s' % apikey, 'Content-type': 'application/json'}, params= {"include[]": "channel"},verify=False,)
+		logger.debug('Using %s%s' % (pager_url,log_id))
+		r = requests.get(pager_url + log_id, headers={'Authorization': 'Token token=%s' % pager_api, 'Content-type': 'application/json'}, params= {"include[]": "channel"},verify=False,)
 		#Make it easier to handle
 		data = json.loads(r.text)['log_entry']['channel']['body']
 		logger.debug('version = %s' % version)
@@ -116,10 +121,10 @@ class hooks:
 		logger.debug('@ create_issue before try')
 		try:
 			if version == 'Hyperic':
-				al_firing, al_direct, ad_info = self.request_email(log_url, apikey, log_id, version)
+				al_firing, al_direct, ad_info = self.request_email(pager_url, pager_api, log_id, version)
 				description = description + " \nAlert currently firing : %s\n Link to resource firing: %s\n Resources  %s" % (al_firing, al_direct, ad_info) 
 			elif version == 'AlertSite':
-				data = self.request_email(log_url, apikey, log_id, version)
+				data = self.request_email(pager_url, pager_api, log_id, version)
 				description = description + "\n%s" % data
 			logger.info('Creating issue for project: %s summary: %s version: %s priority: %s' % (project, summary, version, priority))
 			jira_issue = jira.create_issue(fields={"project":{'key': project}, "summary":summary, "description":description, "priority": {"id": priority},"customfield_11931": {"value": version}, "issuetype":{"id": "59"}})
@@ -135,10 +140,10 @@ class hooks:
                 logger.info('DEBUG: @ HDPT_issue before try')
 		try:
 			if version == 'Hyperic':
-                                al_firing, al_direct, ad_info = self.request_email(log_url, apikey, log_id, version)
+                                al_firing, al_direct, ad_info = self.request_email(pager_url, pager_api, log_id, version)
                                 description = description + " '\nAlert currently firing : %s\n Link to resource firing: %s\n Resources  %s" % (al_firing, al_direct, ad_info)
                         elif version == "AlertSite":
-				data = self.request_email(log_url, apikey, log_id, version)
+				data = self.request_email(pager_url, pager_api, log_id, version)
 				description = description + "\n%s" % data	
                         logger.info('Creating issue for project: %s summary: %s version: %s priority: %s' % (project, summary, version, priority))
                         return jira.create_issue(fields={"project":{'key': project}, "summary":summary, "description":description, "priority": {"id": priority},"customfield_10290": version, "issuetype":{"name": "Task"}, "versions": [{"name": "Production Support"}], "components":[{"name": "Monitoring-Alerting"}]})
@@ -201,39 +206,44 @@ class hooks:
                 	logger.error("check_service else error: %s" % service)
 			logger.error(data)
 # When page is loaded, check this issue. (Used for Hyperic Alerting)
+	def parse_data(self, data):
+		#Variables
+		logger.info('Checking incident: %s' % d["data"]["incident"]["id"])
+		type = d["type"]
+		incident = d["data"]["incident"]["id"]
+		pagerduty_url = d["data"]["incident"]["html_url"]
+		service_summary = d["data"]["incident"]["trigger_summary_data"]["subject"]
+		escalation_policy = d["data"]["incident"]["escalation_policy"]["name"]
+		service_name = d["data"]["incident"]["service"]["name"]
+		trigger_details_html_url = d["data"]["incident"]["trigger_details_html_url"]
+		log_id = trigger_details_html_url.split('/')[-1]
+		service_id = d["data"]["incident"]["service"]["id"]
+		version, priority_s = self.check_service(service_name)
+		priority = priority_s.split(' ')[0]
+		return incident, pagerduty_url, service_summary, escalation_policy, service_name, trigger_details_html_url, log_id, service_id,version, priority_s, priority
 	def GET(self):
-		issue = jira.issue('TIME-654')
+		issue = jira.issue(mon_ticket)
                 return issue.fields.assignee
 # Handles POST's then creates or updates issues. 
 	def POST(self):
-		global app
 		data = web.data()
-		data1 = json.loads(data)["messages"]
 		#Tell pagerduty 'OK' that we received their post then send it to HANDLE to process
-		#if wait_var > datetime.datetime.now()-datetime.timedelta(seconds=3):
-		#thread = threading.Thread(target=self.MANAGE_POST, args=(data1,))
-		app.add_processor(self.MANAGE_POST(data1))
+		thread = threading.Thread(target=self.MANAGE_POST, args=(data))
+		thread.start()
 		return web.ok 
 			 
-	def MANAGE_POST(self, data1):
+	def MANAGE_POST(self, data):
 		#Handle information from post
 		#Pagerduty at times will send two api posts at once. Therefore we need to go through each of them.
+		tLock.acquire()
+		logger.debug("Acquiring lock for: ", data)
+		data1 = json.loads(data)["messages"]
 		for d in data1:
-			#Variables
-			logger.info('Checking incident: %s' % d["data"]["incident"]["id"])
-			type = d["type"]
-			incident = d["data"]["incident"]["id"]
-			pagerduty_url = d["data"]["incident"]["html_url"]
-			service_summary = d["data"]["incident"]["trigger_summary_data"]["subject"]
-			escalation_policy = d["data"]["incident"]["escalation_policy"]["name"]
-			service_name = d["data"]["incident"]["service"]["name"]
-			trigger_details_html_url = d["data"]["incident"]["trigger_details_html_url"]
-			log_id = trigger_details_html_url.split('/')[-1]
-			service_id = d["data"]["incident"]["service"]["id"]
-			version, priority_s = self.check_service(service_name)
-			priority = priority_s.split(' ')[0]
+			incident, pagerduty_url, service_summary, escalation_policy, service_name, trigger_details_html_url, log_id, service_id,version, priority_s, priority = self.parse_data(d)
 			service_s = ""
 			if self.check_recent_incidents(incident, type) == True:
+				logger.debug("Releasing lock for recent incident: ", data)
+				tLock.release()
 				return 'OK'
 			if service_summary.startswith("[HQ]"):
 				for n in service_summary.split("- ")[2:]:
@@ -256,6 +266,8 @@ class hooks:
 			#
 			if type == "incident.trigger" and priority in ("2", "4", "5"):
 				if self.check_linked(project, service_s):
+					logger.debug("Releasing lock for linked issue: ", data)
+					tLock.release()
 					return 'Linked Issue'
 				now = datetime.datetime.now().strftime('%m-%d-%Y %H:%M:%S')
 				logger.info('Searching project : %s description: %s type: %s status not in (closed, resolved) and priority in (2,4,5)' % (project, service_s, jira_type))
@@ -274,14 +286,16 @@ class hooks:
 				else:
 					logger.info('Creating new issue')
 					if project == "HDPT":
-						return self.HDPT_issue(project, "%s - %s : %s" % (service_s, time.strftime("%X"), incident), description, version, priority, log_id)
+						self.HDPT_issue(project, "%s - %s : %s" % (service_s, time.strftime("%X"), incident), description, version, priority, log_id)
 					else:
-						return self.create_issue(project, "%s - %s : %s" % (service_s, time.strftime("%X"), incident), description, version, priority, log_id)
+						self.create_issue(project, "%s - %s : %s" % (service_s, time.strftime("%X"), incident), description, version, priority, log_id)
 			#
 			#  On-Call production alerts. Sev 3
 			#
 			elif type == "incident.trigger" and priority in ("1", "3"):
 				if self.check_linked(project, service_s):
+					logger.debug("Releasing lock for linked issue: ", data)
+					Lock.release()
                                         return 'Linked Issue'
 				logger.debug('Searching project: %s version: %s priority_s: %s jira_type: %s' % (project,version, priority_s, jira_type))
 				jira_issue = jira.search_issues('project = %s and type = %s and reporter = pagerduty and %s %s and priority = "%s" order by created' % (project, jira_type, search_version, version, priority_s))
@@ -319,9 +333,9 @@ class hooks:
 				elif jira_diff > datetime.timedelta(hours=2) or (jira_status not in check_list):
 					logger.info('Greater than 2 hours create new ticket')
 					if project == "HDPT":
-						return self.HDPT_issue(project, "%s - %s : %s" % (service_s, time.strftime("%X"), incident), description, version, priority, log_id)
+						self.HDPT_issue(project, "%s - %s : %s" % (service_s, time.strftime("%X"), incident), description, version, priority, log_id)
 					else:
-						return self.create_issue(project, "%s : %s - %s" % (service_s, time.strftime("%X"), incident), description, version, priority, log_id)
+						self.create_issue(project, "%s : %s - %s" % (service_s, time.strftime("%X"), incident), description, version, priority, log_id)
 				else:
 					logger.error("Error firing in Incident Trigger")
 					logger.error(data1) 
@@ -400,6 +414,8 @@ class hooks:
 				pass #do nothing with resolved issues from Prod tickets
 			else : 
 				logger.error("Error at end of POST: %s" % data1)
+		logger.debug("Releasing lock: ", data)
+		tLock.release()
 		return 'OK'
 #Class to run as daemon
 class app_daemon():
@@ -409,7 +425,7 @@ class app_daemon():
         self.stdin_path = '/dev/null'
         self.stdout_path = '/dev/null'
         self.stderr_path = '/dev/null'
-        self.pidfile_path =  '/var/run/jira-hook/hooks.pid'
+        self.pidfile_path =  '/jira-hook/hooks.pid'
         self.pidfile_timeout = 5
 
     def run(self):
@@ -418,7 +434,7 @@ class app_daemon():
         while True:
                 if __name__ == '__main__':
 			#run on ip 10.251.0.41 and port 444
-                        web.httpserver.runsimple(app.wsgifunc(), ("10.251.0.41", 444))
+                        web.httpserver.runsimple(app.wsgifunc(), (listen_ip, listen_port))
                         app.run()
                 time.sleep(10)
 appdaemon = app_daemon()
